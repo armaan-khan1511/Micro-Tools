@@ -13,6 +13,9 @@ export default defineConfig({
           if (id.includes('node_modules/pdf-lib')) {
             return 'vendor-pdflib'
           }
+          if (id.includes('node_modules/pdfjs-dist')) {
+            return 'vendor-pdfjs'
+          }
           if (id.includes('node_modules/jszip')) {
             return 'vendor-jszip'
           }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Sun, Moon, ShieldCheck, Layers } from 'lucide-react'
+import { Sun, Moon, Wrench, Menu, X } from 'lucide-react'
 
 interface HeaderProps {
   currentPath: string
@@ -8,6 +8,7 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({ currentPath, onNavigate }) => {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
   useEffect(() => {
     const savedTheme = localStorage.getItem('microtools-theme') as 'dark' | 'light' | null
@@ -21,63 +22,136 @@ export const Header: React.FC<HeaderProps> = ({ currentPath, onNavigate }) => {
   }, [])
 
   const toggleTheme = () => {
-    const newTheme = theme === 'dark' ? 'light' : 'dark'
-    setTheme(newTheme)
-    document.documentElement.setAttribute('data-theme', newTheme)
-    localStorage.setItem('microtools-theme', newTheme)
+    const nextTheme = theme === 'dark' ? 'light' : 'dark'
+    setTheme(nextTheme)
+    document.documentElement.setAttribute('data-theme', nextTheme)
+    localStorage.setItem('microtools-theme', nextTheme)
+  }
+
+  const handleNav = (path: string) => {
+    setMobileMenuOpen(false)
+    onNavigate(path)
   }
 
   return (
     <header className="header-wrapper">
       <div className="header-inner">
+        {/* Brand */}
         <a
           href="/"
           className="brand-link"
           onClick={(e) => {
             e.preventDefault()
-            onNavigate('/')
+            handleNav('/')
           }}
         >
           <div className="brand-logo-icon">
-            <Layers size={18} />
+            <Wrench size={18} />
           </div>
-          <span>MicroTools</span>
-          <span className="badge badge-green" style={{ marginLeft: '0.25rem', fontSize: '0.68rem' }}>
-            <ShieldCheck size={11} /> 100% In-Browser
-          </span>
+          <span className="brand-name">MicroTools</span>
         </a>
 
-        <nav className="nav-links">
+        {/* Desktop Navigation Links */}
+        <nav className="nav-desktop">
           <a
-            href="/"
-            className={`nav-link ${currentPath === '/' ? 'active' : ''}`}
+            href="/tools"
+            className={`nav-link ${currentPath === '/tools' ? 'active' : ''}`}
             onClick={(e) => {
               e.preventDefault()
-              onNavigate('/')
+              handleNav('/tools')
             }}
           >
-            All Tools
+            Tools
+          </a>
+          <a
+            href="/categories"
+            className={`nav-link ${currentPath === '/categories' ? 'active' : ''}`}
+            onClick={(e) => {
+              e.preventDefault()
+              handleNav('/categories')
+            }}
+          >
+            Categories
           </a>
           <a
             href="/about"
             className={`nav-link ${currentPath === '/about' ? 'active' : ''}`}
             onClick={(e) => {
               e.preventDefault()
-              onNavigate('/about')
+              handleNav('/about')
             }}
           >
-            Privacy & Specs
+            Privacy & About
           </a>
+
+          {/* Theme Toggle */}
           <button
-            className="btn-icon"
+            type="button"
+            className="btn-theme-toggle"
             onClick={toggleTheme}
-            title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+            title={theme === 'dark' ? 'Switch to Light mode' : 'Switch to Dark mode'}
             aria-label="Toggle theme"
           >
             {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
           </button>
         </nav>
+
+        {/* Mobile Actions */}
+        <div className="nav-mobile-actions">
+          <button
+            type="button"
+            className="btn-theme-toggle"
+            onClick={toggleTheme}
+            aria-label="Toggle theme"
+          >
+            {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+          </button>
+          <button
+            type="button"
+            className="btn-mobile-menu"
+            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            aria-label={mobileMenuOpen ? 'Close menu' : 'Open menu'}
+          >
+            {mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}
+          </button>
+        </div>
       </div>
+
+      {/* Mobile Dropdown Menu */}
+      {mobileMenuOpen && (
+        <div className="nav-mobile-dropdown">
+          <a
+            href="/tools"
+            className={`nav-mobile-link ${currentPath === '/tools' ? 'active' : ''}`}
+            onClick={(e) => {
+              e.preventDefault()
+              handleNav('/tools')
+            }}
+          >
+            Tools
+          </a>
+          <a
+            href="/categories"
+            className={`nav-mobile-link ${currentPath === '/categories' ? 'active' : ''}`}
+            onClick={(e) => {
+              e.preventDefault()
+              handleNav('/categories')
+            }}
+          >
+            Categories
+          </a>
+          <a
+            href="/about"
+            className={`nav-mobile-link ${currentPath === '/about' ? 'active' : ''}`}
+            onClick={(e) => {
+              e.preventDefault()
+              handleNav('/about')
+            }}
+          >
+            Privacy & About
+          </a>
+        </div>
+      )}
     </header>
   )
 }

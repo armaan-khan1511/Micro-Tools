@@ -1,41 +1,159 @@
 import JSZip from 'jszip'
+import { calculateHashWithWorker } from '../../../workers/hashWorkerClient'
+
+export interface ZipCreateOptions {
+  compression?: 'STORE' | 'DEFLATE'
+  compressionLevel?: number // 1 to 9
+  comment?: string
+}
 
 export interface ZipEntryInfo {
-  name: string
-  size: number
+  name: string            // Sanitized safe relative path
+  originalName: string    // Original path directly from archive entry
+  size: number            // Uncompressed size in bytes
+  compressedSize: number  // Compressed size in bytes
   isDir: boolean
+  isTraversalAttempt: boolean
+  isDangerous: boolean
+  date?: Date
+}
+
+export interface ExtractedZipItem {
+  name: string
+  blob: Blob
+  size: number
+  isDangerous: boolean
+}
+
+// Dangerous extensions that could carry executable code or scripts
+export const DANGEROUS_EXTENSIONS = new Set([
+  'exe', 'bat', 'cmd', 'sh', 'vbs', 'vbe', 'js', 'jse', 'scr', 'msi',
+  'dll', 'com', 'ps1', 'psm1', 'jar', 'hta', 'cpl', 'pif', 'reg', 'wsf',
+  'wsh', 'app', 'dmg', 'apk', 'bin', 'deb', 'rpm', 'run'
+])
+
+/**
+ * Detects if a filename has a potentially dangerous/executable extension.
+ */
+export function isDangerousFileType(filename: string): boolean {
+  const clean = filename.trim().toLowerCase()
+  const parts = clean.split('.')
+  if (parts.length <= 1) return false
+  const ext = parts[parts.length - 1]
+  return DANGEROUS_EXTENSIONS.has(ext)
+}
+
+/**
+ * Sanitizes a ZIP entry path to prevent Zip Slip (path traversal) vulnerabilities.
+ * Strips leading slashes, Windows drive letters, null bytes, and traversal sequences.
+ */
+export function sanitizeZipEntryPath(rawPath: string): {
+  safePath: string
+  isTraversalAttempt: boolean
+} {
+  // Normalize Windows backslashes to forward slashes
+  let normalized = rawPath.replace(/\\/g, '/').trim()
+
+  // Detect null byte injection
+  let isTraversalAttempt = false
+  if (normalized.includes('\0')) {
+    isTraversalAttempt = true
+    normalized = normalized.replace(/\0/g, '')
+  }
+
+  // Remove leading drive letters (e.g. C:/ or D:/)
+  if (/^[a-zA-Z]:\//.test(normalized)) {
+    isTraversalAttempt = true
+    normalized = normalized.replace(/^[a-zA-Z]:\//, '')
+  }
+
+  // Split into components and resolve traversals
+  const parts = normalized.split('/')
+  const safeParts: string[] = []
+
+  for (const part of parts) {
+    const trimmed = part.trim()
+    if (!trimmed || trimmed === '.') {
+      continue
+    }
+    if (trimmed === '..') {
+      isTraversalAttempt = true
+      // Reject traversal above root
+      if (safeParts.length > 0) {
+        safeParts.pop()
+      }
+      continue
+    }
+
+    // Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    const baseName = trimmed.split('.')[0].toUpperCase()
+    const isReservedDevice = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(baseName)
+    const safeSegment = isReservedDevice ? `safe_${trimmed}` : trimmed
+    safeParts.push(safeSegment)
+  }
+
+  const safePath = safeParts.join('/') || 'unnamed_file'
+  return {
+    safePath,
+    isTraversalAttempt,
+  }
 }
 
 /**
  * Creates a standard compressed .zip file from multiple files with progress reporting.
+ * Preserves filenames and optional relative folder paths.
  */
 export async function createZip(
   files: File[],
+  options: ZipCreateOptions = {},
   onProgress?: (progress: number, status: string) => void
 ): Promise<Blob> {
   if (files.length === 0) {
-    throw new Error('Please select at least one file to create a ZIP.')
+    throw new Error('Please select at least one file to create a ZIP archive.')
   }
 
   onProgress?.(10, 'Preparing files for archive...')
   const zip = new JSZip()
+  const usedNames = new Set<string>()
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i]
-    zip.file(file.name, file)
+    // Preserve relative folder path if available (from webkitRelativePath or drag-folder)
+    let path = (file as any).webkitRelativePath || file.name || `file_${i + 1}`
+    
+    // Prevent duplicate paths overwriting each other
+    if (usedNames.has(path)) {
+      const dotIndex = path.lastIndexOf('.')
+      if (dotIndex > -1) {
+        const namePart = path.substring(0, dotIndex)
+        const extPart = path.substring(dotIndex)
+        path = `${namePart} (${i + 1})${extPart}`
+      } else {
+        path = `${path} (${i + 1})`
+      }
+    }
+    usedNames.add(path)
+
+    zip.file(path, file)
   }
 
-  onProgress?.(30, 'Compressing archive with DEFLATE...')
+  const compressionMethod = options.compression || 'DEFLATE'
+  const compressionLevel = options.compressionLevel ?? 6
+
+  onProgress?.(25, `Compressing archive with ${compressionMethod}...`)
+
   const content = await zip.generateAsync(
     {
       type: 'blob',
-      compression: 'DEFLATE',
-      compressionOptions: { level: 6 },
+      compression: compressionMethod,
+      compressionOptions: compressionMethod === 'DEFLATE' ? { level: compressionLevel } : undefined,
+      comment: options.comment || 'Generated by MicroTools (100% Client-Side)',
     },
     (metadata) => {
+      const pct = Math.round(metadata.percent)
       onProgress?.(
-        30 + Math.round((metadata.percent / 100) * 65),
-        `Compressing: ${Math.round(metadata.percent)}%`
+        25 + Math.round((pct / 100) * 70),
+        `Compressing archive: ${pct}%`
       )
     }
   )
@@ -45,7 +163,8 @@ export async function createZip(
 }
 
 /**
- * Inspects the contents of a ZIP file without fully extracting everything.
+ * Inspects the contents of a ZIP file without fully extracting into memory.
+ * Applies Zip Slip sanitization and dangerous filetype tagging.
  */
 export async function inspectZip(zipFile: File): Promise<ZipEntryInfo[]> {
   const zip = new JSZip()
@@ -54,85 +173,490 @@ export async function inspectZip(zipFile: File): Promise<ZipEntryInfo[]> {
 
   const entries: ZipEntryInfo[] = []
   loadedZip.forEach((relativePath, zipEntry) => {
-    // JSZip uses internal _data for uncompressed size or provides async
+    const { safePath, isTraversalAttempt } = sanitizeZipEntryPath(relativePath)
+    const isDir = zipEntry.dir || relativePath.endsWith('/')
+    const isDangerous = !isDir && isDangerousFileType(safePath)
+
     entries.push({
-      name: relativePath,
+      name: safePath,
+      originalName: relativePath,
       size: (zipEntry as any)._data?.uncompressedSize || 0,
-      isDir: zipEntry.dir,
+      compressedSize: (zipEntry as any)._data?.compressedSize || 0,
+      isDir,
+      isTraversalAttempt,
+      isDangerous,
+      date: zipEntry.date,
     })
   })
 
-  return entries
+  // Sort directories first, then alphabetically
+  return entries.sort((a, b) => {
+    if (a.isDir && !b.isDir) return -1
+    if (!a.isDir && b.isDir) return 1
+    return a.name.localeCompare(b.name)
+  })
 }
 
 /**
- * Extracts a specific entry from a ZIP archive as a downloadable Blob.
+ * Extracts a specific entry from a ZIP archive as a downloadable safe Blob.
  */
-export async function extractZipEntry(zipFile: File, entryName: string): Promise<Blob> {
+export async function extractZipEntry(
+  zipFile: File,
+  originalEntryName: string
+): Promise<{ blob: Blob; safeFilename: string; isDangerous: boolean }> {
   const zip = new JSZip()
   const arrayBuffer = await zipFile.arrayBuffer()
   const loadedZip = await zip.loadAsync(arrayBuffer)
-  const entry = loadedZip.file(entryName)
-
+  
+  const entry = loadedZip.file(originalEntryName)
   if (!entry) {
-    throw new Error(`File "${entryName}" not found in archive.`)
+    throw new Error(`File "${originalEntryName}" not found in archive.`)
   }
 
-  return await entry.async('blob')
+  const { safePath } = sanitizeZipEntryPath(originalEntryName)
+  const safeFilename = safePath.split('/').pop() || 'extracted_file'
+  const isDangerous = isDangerousFileType(safeFilename)
+
+  const blob = await entry.async('blob')
+  return {
+    blob,
+    safeFilename,
+    isDangerous,
+  }
 }
 
 /**
- * Computes a cryptographic hash using the browser's hardware-accelerated Web Crypto API.
+ * Extracts all non-directory files from a ZIP archive with sanitized paths.
+ */
+export async function extractAllZipEntries(
+  zipFile: File,
+  onProgress?: (progress: number, status: string) => void
+): Promise<ExtractedZipItem[]> {
+  const zip = new JSZip()
+  onProgress?.(10, 'Reading archive...')
+  const arrayBuffer = await zipFile.arrayBuffer()
+  const loadedZip = await zip.loadAsync(arrayBuffer)
+
+  const fileEntries: { relativePath: string; entry: JSZip.JSZipObject }[] = []
+  loadedZip.forEach((relativePath, entry) => {
+    if (!entry.dir && !relativePath.endsWith('/')) {
+      fileEntries.push({ relativePath, entry })
+    }
+  })
+
+  const results: ExtractedZipItem[] = []
+  const total = fileEntries.length
+
+  for (let i = 0; i < total; i++) {
+    const { relativePath, entry } = fileEntries[i]
+    const { safePath } = sanitizeZipEntryPath(relativePath)
+    const isDangerous = isDangerousFileType(safePath)
+    
+    onProgress?.(
+      15 + Math.round((i / total) * 80),
+      `Extracting: ${safePath} (${i + 1}/${total})`
+    )
+
+    const blob = await entry.async('blob')
+    results.push({
+      name: safePath,
+      blob,
+      size: blob.size,
+      isDangerous,
+    })
+  }
+
+  onProgress?.(100, 'All files extracted safely!')
+  return results
+}
+
+/**
+ * Computes a cryptographic hash of plain text using Web Crypto API.
+ */
+export async function calculateTextHash(
+  text: string,
+  algorithm: 'SHA-256' | 'SHA-512' | 'SHA-1' = 'SHA-256'
+): Promise<string> {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(text)
+  const hashBuffer = await crypto.subtle.digest(algorithm, data)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * Computes a cryptographic hash using Web Crypto API or Web Worker.
  */
 export async function calculateFileHash(
   file: File,
   algorithm: 'SHA-256' | 'SHA-512' | 'SHA-1' = 'SHA-256',
   onProgress?: (progress: number, status: string) => void
 ): Promise<string> {
-  onProgress?.(10, `Reading ${file.name} into memory...`)
+  // If Worker is available and file is large (> 5MB), use worker for off-thread performance
+  if (typeof Worker !== 'undefined' && file.size > 5 * 1024 * 1024) {
+    try {
+      return await calculateHashWithWorker(file, algorithm, onProgress)
+    } catch {
+      // Fallback to direct SubtleCrypto
+    }
+  }
+
+  onProgress?.(20, 'Reading file buffer into memory...')
   const arrayBuffer = await file.arrayBuffer()
 
-  onProgress?.(50, `Hashing via Web Crypto SubtleCrypto (${algorithm})...`)
+  onProgress?.(60, `Computing ${algorithm} checksum via Web Crypto...`)
   const hashBuffer = await crypto.subtle.digest(algorithm, arrayBuffer)
-
-  onProgress?.(90, 'Formatting hexadecimal digest...')
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
 
-  onProgress?.(100, 'Hash generated!')
+  onProgress?.(100, `${algorithm} computed successfully!`)
   return hashHex
 }
 
 /**
- * Encodes a file to Base64 Data URL string.
+ * Converts a UTF-8 string to Base64 (supporting Unicode & emojis safely).
  */
-export function fileToBase64(file: File): Promise<string> {
+export function textToBase64(text: string): string {
+  const encoder = new TextEncoder()
+  const bytes = encoder.encode(text)
+  let binary = ''
+  const len = bytes.byteLength
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
+}
+
+/**
+ * Decodes a Base64 string to a UTF-8 text string (supporting Unicode & emojis safely).
+ * Validates Base64 characters and throws understandable error if malformed.
+ */
+export function base64ToText(base64: string): string {
+  const clean = base64.trim().replace(/\s/g, '')
+  if (!clean) return ''
+
+  // Validate Base64 characters
+  if (!/^[A-Za-z0-9+/=]+$/.test(clean)) {
+    throw new Error('Invalid Base64 string: Contains illegal non-Base64 characters.')
+  }
+
+  let binary: string
+  try {
+    binary = atob(clean)
+  } catch (err: any) {
+    throw new Error(`Failed to decode Base64: ${err.message || 'Malformed padding or length.'}`)
+  }
+
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+
+  const decoder = new TextDecoder('utf-8', { fatal: false })
+  return decoder.decode(bytes)
+}
+
+/**
+ * Encodes a binary file to Base64 Data URL or raw Base64 string.
+ */
+export function fileToBase64(file: File, asDataUrl = true): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
-    reader.onload = () => resolve(reader.result as string)
+    reader.onload = () => {
+      const result = reader.result as string
+      if (asDataUrl) {
+        resolve(result)
+      } else {
+        const commaIndex = result.indexOf(',')
+        resolve(commaIndex > -1 ? result.substring(commaIndex + 1) : result)
+      }
+    }
     reader.onerror = (err) => reject(err)
     reader.readAsDataURL(file)
   })
 }
 
 /**
- * Converts a Base64 string to a downloadable Blob.
+ * Converts a Base64 or Data URI string to a downloadable Blob with detected MIME type.
+ */
+export function base64ToFileBlob(
+  base64: string,
+  fallbackMime = 'application/octet-stream'
+): { blob: Blob; mimeType: string; suggestedExtension: string } {
+  const clean = base64.trim()
+  const dataUriMatch = clean.match(/^data:([^;]+);base64,(.+)$/s)
+
+  let mimeType = fallbackMime
+  let rawBase64 = clean
+
+  if (dataUriMatch) {
+    mimeType = dataUriMatch[1]
+    rawBase64 = dataUriMatch[2]
+  }
+
+  // Clean any inner whitespace or newlines
+  const sanitized = rawBase64.replace(/\s/g, '')
+  if (!/^[A-Za-z0-9+/=]+$/.test(sanitized)) {
+    throw new Error('Invalid Base64 payload: Contains characters outside the Base64 alphabet.')
+  }
+
+  const binary = atob(sanitized)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+
+  const mimeToExt: Record<string, string> = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/svg+xml': 'svg',
+    'application/pdf': 'pdf',
+    'application/zip': 'zip',
+    'application/json': 'json',
+    'text/plain': 'txt',
+    'audio/mpeg': 'mp3',
+    'audio/wav': 'wav',
+    'video/mp4': 'mp4',
+  }
+
+  const suggestedExtension = mimeToExt[mimeType] || 'bin'
+  const blob = new Blob([bytes], { type: mimeType })
+  return { blob, mimeType, suggestedExtension }
+}
+
+/**
+ * Backward-compatible helper for existing code.
  */
 export function base64ToBlob(base64: string): Blob {
-  const parts = base64.split(';base64,')
-  let contentType = ''
-  let rawBase64 = base64
+  return base64ToFileBlob(base64).blob
+}
 
-  if (parts.length === 2) {
-    contentType = parts[0].replace('data:', '')
-    rawBase64 = parts[1]
+// ============================================================================
+// FILE METADATA INSPECTOR ENGINE
+// ============================================================================
+
+export interface FileMetadataResult {
+  fileName: string
+  fileExtension: string
+  fileSizeBytes: number
+  formattedSize: string
+  mimeType: string
+  lastModifiedDate: string
+  sha256Hash: string
+  magicBytesHex: string
+  magicBytesAscii: string
+  detectedFormat: string
+  signatureMatched: boolean
+  details: Record<string, string | number | boolean>
+}
+
+/**
+ * Formats raw bytes to human readable string (KB, MB, GB).
+ */
+function formatSize(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`
+}
+
+/**
+ * Inspects any file client-side to extract deep metadata, magic bytes, SHA-256, and format-specific attributes.
+ */
+export async function inspectFileMetadata(file: File): Promise<FileMetadataResult> {
+  const fileName = file.name
+  const dotIndex = fileName.lastIndexOf('.')
+  const fileExtension = dotIndex > -1 ? fileName.substring(dotIndex + 1).toLowerCase() : 'none'
+  const fileSizeBytes = file.size
+  const formattedSize = formatSize(fileSizeBytes)
+  const mimeType = file.type || 'application/octet-stream'
+  const lastModifiedDate = file.lastModified
+    ? new Date(file.lastModified).toLocaleString()
+    : 'Unknown'
+
+  // 1. Read first 32 bytes for Magic Bytes inspection
+  const headerSlice = file.slice(0, 32)
+  const headerBuffer = await headerSlice.arrayBuffer()
+  const headerBytes = new Uint8Array(headerBuffer)
+
+  const hexArray: string[] = []
+  let asciiStr = ''
+  for (let i = 0; i < headerBytes.length; i++) {
+    const byte = headerBytes[i]
+    hexArray.push(byte.toString(16).padStart(2, '0').toUpperCase())
+    asciiStr += byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.'
+  }
+  const magicBytesHex = hexArray.join(' ')
+  const magicBytesAscii = asciiStr
+
+  // 2. Identify File Signature
+  let detectedFormat = 'Generic / Unknown Binary'
+  let signatureMatched = true
+
+  const h = hexArray
+  if (h[0] === '89' && h[1] === '50' && h[2] === '4E' && h[3] === '47') {
+    detectedFormat = 'PNG Image'
+    signatureMatched = fileExtension === 'png'
+  } else if (h[0] === 'FF' && h[1] === 'D8' && h[2] === 'FF') {
+    detectedFormat = 'JPEG Image'
+    signatureMatched = fileExtension === 'jpg' || fileExtension === 'jpeg'
+  } else if (h[0] === '47' && h[1] === '49' && h[2] === '46' && h[3] === '38') {
+    detectedFormat = 'GIF Image'
+    signatureMatched = fileExtension === 'gif'
+  } else if (h[0] === '25' && h[1] === '50' && h[2] === '44' && h[3] === '46') {
+    detectedFormat = 'PDF Document (%PDF)'
+    signatureMatched = fileExtension === 'pdf'
+  } else if (h[0] === '50' && h[1] === '4B' && (h[2] === '03' || h[2] === '05' || h[2] === '07')) {
+    detectedFormat = 'ZIP Archive / OpenXML Package'
+    signatureMatched = ['zip', 'docx', 'xlsx', 'pptx', 'jar', 'apk'].includes(fileExtension)
+  } else if (h[0] === '1A' && h[1] === '45' && h[2] === 'DF' && h[3] === 'A3') {
+    detectedFormat = 'WebM / Matroska (MKV) Container'
+    signatureMatched = fileExtension === 'webm' || fileExtension === 'mkv'
+  } else if (h[4] === '66' && h[5] === '74' && h[6] === '79' && h[7] === '70') {
+    detectedFormat = 'ISO Base Media / MP4 Video (ftyp)'
+    signatureMatched = ['mp4', 'm4a', 'mov'].includes(fileExtension)
+  } else if (h[0] === '49' && h[1] === '44' && h[2] === '33') {
+    detectedFormat = 'MP3 Audio (ID3v2 tag)'
+    signatureMatched = fileExtension === 'mp3'
+  } else if (h[0] === '52' && h[1] === '49' && h[2] === '46' && h[3] === '46') {
+    // RIFF container: can be WAV or WebP
+    if (asciiStr.includes('WEBP')) {
+      detectedFormat = 'WebP Image (RIFF)'
+      signatureMatched = fileExtension === 'webp'
+    } else if (asciiStr.includes('WAVE')) {
+      detectedFormat = 'WAV Audio (RIFF)'
+      signatureMatched = fileExtension === 'wav'
+    } else {
+      detectedFormat = 'RIFF Container'
+    }
+  } else if (h[0] === '42' && h[1] === '4D') {
+    detectedFormat = 'Windows Bitmap (BMP)'
+    signatureMatched = fileExtension === 'bmp'
+  } else if (h[0] === '4F' && h[1] === '67' && h[2] === '67' && h[3] === '53') {
+    detectedFormat = 'Ogg Container (OggS)'
+    signatureMatched = ['ogg', 'oga', 'ogv'].includes(fileExtension)
+  } else if (h[0] === '7B' || h[0] === '5B') {
+    // '{' or '['
+    detectedFormat = 'JSON / Structured Text'
+    signatureMatched = fileExtension === 'json' || fileExtension === 'txt'
+  } else if (asciiStr.startsWith('<?xml') || asciiStr.startsWith('<html') || asciiStr.startsWith('<!DOC')) {
+    detectedFormat = 'XML / HTML Markup'
+    signatureMatched = ['xml', 'html', 'htm', 'svg'].includes(fileExtension)
   }
 
-  const byteCharacters = atob(rawBase64.replace(/\s/g, ''))
-  const byteNumbers = new Array(byteCharacters.length)
-  for (let i = 0; i < byteCharacters.length; i++) {
-    byteNumbers[i] = byteCharacters.charCodeAt(i)
+  // 3. Compute SHA-256 Hash
+  let sha256Hash = ''
+  try {
+    const fullBuffer = await file.arrayBuffer()
+    const digest = await crypto.subtle.digest('SHA-256', fullBuffer)
+    sha256Hash = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('')
+  } catch {
+    sha256Hash = 'Could not calculate hash'
   }
-  const byteArray = new Uint8Array(byteNumbers)
-  return new Blob([byteArray], { type: contentType || 'application/octet-stream' })
+
+  // 4. Format-Specific Deep Inspection
+  const details: Record<string, string | number | boolean> = {}
+
+  // A. Image inspection
+  if (file.type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg'].includes(fileExtension)) {
+    try {
+      const url = URL.createObjectURL(file)
+      const img = new Image()
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve()
+        img.onerror = () => reject()
+        img.src = url
+      })
+      details['Dimensions'] = `${img.naturalWidth} × ${img.naturalHeight} pixels`
+      details['Width'] = `${img.naturalWidth} px`
+      details['Height'] = `${img.naturalHeight} px`
+      const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b))
+      const divisor = gcd(img.naturalWidth, img.naturalHeight)
+      if (divisor > 0) {
+        details['Aspect Ratio'] = `${img.naturalWidth / divisor}:${img.naturalHeight / divisor}`
+      }
+      URL.revokeObjectURL(url)
+    } catch {
+      // Ignored if unparseable
+    }
+  }
+
+  // B. Audio/Video duration inspection
+  if (file.type.startsWith('audio/') || file.type.startsWith('video/') || ['mp3', 'wav', 'mp4', 'webm', 'ogg'].includes(fileExtension)) {
+    try {
+      const url = URL.createObjectURL(file)
+      const media = document.createElement(file.type.startsWith('video/') ? 'video' : 'audio')
+      await new Promise<void>((resolve, reject) => {
+        media.onloadedmetadata = () => resolve()
+        media.onerror = () => reject()
+        media.src = url
+      })
+      if (!isNaN(media.duration)) {
+        const mins = Math.floor(media.duration / 60)
+        const secs = Math.floor(media.duration % 60)
+        details['Duration'] = `${mins}:${secs.toString().padStart(2, '0')} (${media.duration.toFixed(2)}s)`
+      }
+      if (media instanceof HTMLVideoElement && media.videoWidth) {
+        details['Video Resolution'] = `${media.videoWidth} × ${media.videoHeight}`
+      }
+      URL.revokeObjectURL(url)
+    } catch {
+      // Ignored if media format cannot be decoded by browser
+    }
+  }
+
+  // C. Text file inspection (lines, characters, words)
+  if (
+    file.type.startsWith('text/') ||
+    ['txt', 'md', 'json', 'csv', 'js', 'ts', 'html', 'css', 'xml', 'log'].includes(fileExtension)
+  ) {
+    try {
+      const text = await file.text()
+      const lines = text.split(/\r\n|\r|\n/).length
+      const words = text.trim() ? text.trim().split(/\s+/).length : 0
+      const chars = text.length
+      details['Line Count'] = lines
+      details['Word Count'] = words
+      details['Character Count'] = chars
+      details['Line Endings'] = text.includes('\r\n') ? 'CRLF (Windows)' : 'LF (Unix/macOS)'
+    } catch {
+      // Ignored
+    }
+  }
+
+  // D. ZIP Archive inspection
+  if (fileExtension === 'zip' || file.type === 'application/zip') {
+    try {
+      const entries = await inspectZip(file)
+      details['Archive Entries'] = entries.length
+      const totalUncompressed = entries.reduce((acc, e) => acc + e.size, 0)
+      details['Total Uncompressed Size'] = formatSize(totalUncompressed)
+      if (fileSizeBytes > 0 && totalUncompressed > 0) {
+        const ratio = ((1 - fileSizeBytes / totalUncompressed) * 100).toFixed(1)
+        details['Estimated Compression Ratio'] = `${ratio}%`
+      }
+    } catch {
+      // Ignored
+    }
+  }
+
+  return {
+    fileName,
+    fileExtension,
+    fileSizeBytes,
+    formattedSize,
+    mimeType,
+    lastModifiedDate,
+    sha256Hash,
+    magicBytesHex,
+    magicBytesAscii,
+    detectedFormat,
+    signatureMatched,
+    details,
+  }
 }

@@ -1,11 +1,34 @@
 import React from 'react'
-import type { ToolDefinition } from '../../core/types/tool'
+import type { ToolDefinition } from '../../types/tool'
 import { ToolIcon } from './ToolIcon'
-import { ArrowRight, ShieldCheck } from 'lucide-react'
+import { ArrowRight } from 'lucide-react'
 
 interface ToolCardProps {
   tool: ToolDefinition
   onClick: (toolId: string) => void
+}
+
+const getCategoryLabel = (cat: string) => {
+  switch (cat) {
+    case 'pdf':
+      return 'PDF'
+    case 'image':
+      return 'Image'
+    case 'document':
+      return 'Document'
+    case 'audio-video':
+    case 'video':
+    case 'audio':
+      return 'Video & Audio'
+    case 'compression':
+      return 'Compression'
+    case 'utilities':
+    case 'archive':
+    case 'utility':
+      return 'Utilities'
+    default:
+      return cat
+  }
 }
 
 export const ToolCard: React.FC<ToolCardProps> = ({ tool, onClick }) => {
@@ -18,25 +41,19 @@ export const ToolCard: React.FC<ToolCardProps> = ({ tool, onClick }) => {
         onClick(tool.id)
       }}
     >
-      <div className="tool-card-header">
+      <div className="tool-card-top">
         <div className="tool-card-icon">
           <ToolIcon name={tool.icon} size={20} />
         </div>
-        <span className="badge" style={{ fontSize: '0.7rem' }}>
-          {tool.category}
-        </span>
+        <span className="tool-card-category">{getCategoryLabel(tool.category)}</span>
       </div>
 
       <h3 className="tool-card-title">{tool.name}</h3>
       <p className="tool-card-desc">{tool.description}</p>
 
-      <div className="tool-card-footer">
-        <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', color: 'var(--accent-emerald)' }}>
-          <ShieldCheck size={13} /> Browser Local
-        </span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', color: 'var(--text-muted)' }}>
-          Open <ArrowRight size={13} />
-        </span>
+      <div className="tool-card-action">
+        <span>Open Tool</span>
+        <ArrowRight size={14} className="tool-card-arrow" />
       </div>
     </a>
   )
